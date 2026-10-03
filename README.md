@@ -2,7 +2,6 @@
 
 One server for everything CLOVET needs from the cloud:
 - **AI features** — smart replies, chat summaries, translation (via Claude)
-- **Content moderation** — flags explicit photos/videos before upload (via Claude vision)
 - **Calls** — LiveKit access tokens for voice/video calls
 
 Replaces the two separate services from before (clovet-ai-backend +
@@ -40,13 +39,6 @@ Test the call token endpoint:
 curl -X POST http://localhost:8080/livekit-token \
   -H "Content-Type: application/json" \
   -d '{"roomName":"test-room","participantName":"Sendze","secret":"your-shared-secret"}'
-```
-
-Test the moderation endpoint:
-```
-curl -X POST http://localhost:8080/moderate/image \
-  -H "X-App-Secret: your-shared-secret" \
-  -F "file=@/path/to/some-photo.jpg"
 ```
 
 ## 3. Deploy

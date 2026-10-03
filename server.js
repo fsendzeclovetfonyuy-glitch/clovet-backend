@@ -5,6 +5,7 @@
  *   /api/ai/summarize       → chat summaries, 1:1 and group (Claude)
  *   /api/ai/translate       → message translation (Claude)
  *   /livekit-token          → signed tokens so the app can join calls
+ *   /api/push/call          → push notification that rings a closed phone
  *   /health                 → uptime check
  *
  * This replaces the two separate services (clovet-ai-backend and the
@@ -17,26 +18,10 @@
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const { AccessToken } = require('livekit-server-sdk');
-const multer = require('multer');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-const crypto = require('crypto');
-const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
-const ffprobePath = require('@ffprobe-installer/ffprobe').path;
-const ffmpeg = require('fluent-ffmpeg');
-ffmpeg.setFfmpegPath(ffmpegPath);
-ffmpeg.setFfprobePath(ffprobePath);
+const admin = require('firebase-admin');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
-
-// Holds an uploaded file in memory (not disk) — fine at these size limits,
-// and simpler than managing upload dirs on an ephemeral host like Render.
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 60 * 1024 * 1024 }, // 60MB — generous enough for a short video
-});
 
 // ── Config — set these as environment variables on your host ────────────
 const APP_SHARED_SECRET = process.env.APP_SHARED_SECRET || 'CHANGE_ME';
@@ -44,6 +29,22 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
 const LIVEKIT_WS_URL = process.env.LIVEKIT_WS_URL;
+// Whole Firebase service-account JSON (Firebase console → Project settings →
+// Service accounts → Generate new private key). Paste the file's contents as
+// one environment variable. Only needed for call push notifications.
+const FIREBASE_SERVICE_ACCOUNT = process.env.FIREBASE_SERVICE_ACCOUNT;
+
+let firebaseReady = false;
+if (FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    admin.initializeApp({
+      credential: admin.credential.cert(JSON.parse(FIREBASE_SERVICE_ACCOUNT)),
+    });
+    firebaseReady = true;
+  } catch (e) {
+    console.error('FIREBASE_SERVICE_ACCOUNT is set but invalid:', e.message);
+  }
+}
 
 const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
 
@@ -156,7 +157,7 @@ app.post('/api/ai/translate', checkAuth, async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════
 app.post('/livekit-token', checkAuth, async (req, res) => {
   try {
-    const { roomName, participantName } = req.body || {};
+    const { roomName, participantName, identity, displayName } = req.body || {};
     if (!roomName || !participantName) {
       return res.status(400).json({ error: 'roomName and participantName are required' });
     }
@@ -165,8 +166,10 @@ app.post('/livekit-token', checkAuth, async (req, res) => {
     }
 
     const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
-      identity: `${participantName}_${Date.now()}`,
-      name: participantName,
+      // The app sends the user's id as `identity` so each person is unique
+      // and the app can map them back to a contact name.
+      identity: String(identity || `${participantName}_${Date.now()}`),
+      name: String(displayName || participantName),
       ttl: '6h',
     });
     at.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true });
@@ -180,96 +183,65 @@ app.post('/livekit-token', checkAuth, async (req, res) => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-//  CONTENT MODERATION — explicit-content check on photo/video uploads
+//  PUSH — rings a closed phone. The app sends only a callId; everything else
+//  (who to ring, who's calling) is read from the real call record in
+//  Firestore, so this can't be used to send arbitrary notifications.
 // ═════════════════════════════════════════════════════════════════════════
-// Sends the image (or a sampled video frame) to Claude's vision and asks
-// for a flagged/not-flagged classification. Response shape matches what
-// ContentModerationService in the Flutter app expects: {"flagged": bool}.
-async function classifyImageBuffer(buffer, mimeType) {
-  if (!anthropic) throw new Error('AI not configured');
-  const response = await anthropic.messages.create({
-    model: AI_MODEL,
-    max_tokens: 20,
-    system:
-      'You are a content moderation classifier for a social/messaging app. ' +
-      'Look at the image and decide if it contains pornographic or sexually ' +
-      'explicit content. Reply with ONLY a JSON object, nothing else: ' +
-      '{"flagged": true} or {"flagged": false}.',
-    messages: [
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'image',
-            source: { type: 'base64', media_type: mimeType, data: buffer.toString('base64') },
-          },
-          { type: 'text', text: 'Classify this image.' },
-        ],
+app.post('/api/push/call', checkAuth, async (req, res) => {
+  try {
+    if (!firebaseReady) {
+      return res.status(500).json({ error: 'Push not configured (FIREBASE_SERVICE_ACCOUNT missing or invalid)' });
+    }
+    const callId = String(req.body?.callId || '');
+    if (!callId) return res.status(400).json({ error: 'callId is required' });
+
+    const db = admin.firestore();
+    const snap = await db.collection('calls').doc(callId).get();
+    if (!snap.exists) return res.json({ sent: 0, reason: 'no such call' });
+    const call = snap.data();
+    if (call.status !== 'ringing') return res.json({ sent: 0, reason: 'not ringing' });
+    const created = call.createdAt?.toMillis?.() ?? 0;
+    if (Date.now() - created > 60 * 1000) return res.json({ sent: 0, reason: 'stale' });
+
+    const calleeIds = (call.calleeIds || []).slice(0, 50);
+    const docs = await Promise.all(calleeIds.map((id) => db.collection('fcmTokens').doc(id).get()));
+    const entries = docs
+      .filter((d) => d.exists && d.data().token)
+      .map((d) => ({ id: d.id, token: d.data().token }));
+    if (entries.length === 0) return res.json({ sent: 0, reason: 'no tokens' });
+
+    const caller = call.callerName || 'Someone';
+    const kind = call.isVideo ? 'video' : 'voice';
+    const response = await admin.messaging().sendEachForMulticast({
+      tokens: entries.map((e) => e.token),
+      notification: {
+        title: call.isGroup ? `${call.title || 'Group'} call` : `${caller} is calling`,
+        body: `Incoming ${kind} call — tap to answer`,
       },
-    ],
-  });
-  const text = response.content.find((b) => b.type === 'text')?.text ?? '{"flagged":false}';
-  try {
-    const parsed = JSON.parse(text.trim());
-    return parsed.flagged === true;
-  } catch {
-    // If Claude didn't return clean JSON, fail safe (treat as flagged) rather
-    // than silently letting unmoderated content through.
-    return true;
-  }
-}
-
-function mimeTypeFor(originalname, fallback) {
-  const ext = path.extname(originalname || '').toLowerCase();
-  if (ext === '.png') return 'image/png';
-  if (ext === '.webp') return 'image/webp';
-  if (ext === '.gif') return 'image/gif';
-  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
-  return fallback;
-}
-
-app.post('/moderate/image', checkAuth, upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-    const mimeType = mimeTypeFor(req.file.originalname, 'image/jpeg');
-    const flagged = await classifyImageBuffer(req.file.buffer, mimeType);
-    res.json({ flagged });
-  } catch (e) {
-    console.error('moderate/image error:', e);
-    res.status(500).json({ error: 'Failed to check image' });
-  }
-});
-
-app.post('/moderate/video', checkAuth, upload.single('file'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-
-  // Video frames aren't readable by the vision model directly, so we pull
-  // one frame (~1s in, to skip a possible black first frame) with ffmpeg
-  // and classify that the same way as a photo. Not frame-by-frame
-  // coverage, but catches the common case at negligible cost/latency.
-  const tmpDir = os.tmpdir();
-  const inPath = path.join(tmpDir, `${crypto.randomUUID()}-in`);
-  const outPath = path.join(tmpDir, `${crypto.randomUUID()}-frame.jpg`);
-
-  try {
-    await fs.promises.writeFile(inPath, req.file.buffer);
-
-    await new Promise((resolve, reject) => {
-      ffmpeg(inPath)
-        .on('end', resolve)
-        .on('error', reject)
-        .screenshots({ timestamps: ['1'], filename: path.basename(outPath), folder: tmpDir, size: '512x?' });
+      data: { type: 'call', callId },
+      android: {
+        priority: 'high',
+        ttl: 45000,
+        notification: { sound: 'default', tag: `call_${callId}`, visibility: 'public' },
+      },
     });
 
-    const frameBuffer = await fs.promises.readFile(outPath);
-    const flagged = await classifyImageBuffer(frameBuffer, 'image/jpeg');
-    res.json({ flagged });
+    // Remove tokens that are no longer valid (app uninstalled, etc.).
+    await Promise.all(
+      response.responses.map((r, i) => {
+        const code = r.error?.code;
+        if (code === 'messaging/registration-token-not-registered' ||
+            code === 'messaging/invalid-registration-token') {
+          return db.collection('fcmTokens').doc(entries[i].id).delete().catch(() => {});
+        }
+        return null;
+      })
+    );
+
+    res.json({ sent: response.successCount, failed: response.failureCount });
   } catch (e) {
-    console.error('moderate/video error:', e);
-    res.status(500).json({ error: 'Failed to check video' });
-  } finally {
-    fs.promises.unlink(inPath).catch(() => {});
-    fs.promises.unlink(outPath).catch(() => {});
+    console.error('push/call error:', e);
+    res.status(500).json({ error: 'Failed to send push' });
   }
 });
 
