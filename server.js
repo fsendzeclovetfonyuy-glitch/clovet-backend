@@ -1,251 +1,409 @@
-/**
- * CLOVET Backend — one server for everything CLOVET needs from the cloud:
- *
- *   /api/ai/smart-replies   → suggested quick replies (Claude)
- *   /api/ai/summarize       → chat summaries, 1:1 and group (Claude)
- *   /api/ai/translate       → message translation (Claude)
- *   /livekit-token          → signed tokens so the app can join calls
- *   /api/push/call          → push notification that rings a closed phone
- *   /health                 → uptime check
- *
- * This replaces the two separate services (clovet-ai-backend and the
- * LiveKit token server) — one deployment, one URL, one set of env vars.
- *
- * Your Anthropic API key and LiveKit API secret live ONLY here, server
- * side. Never embed either in the Flutter app.
- */
+'use strict';
+// CLOVET backend — one server for: AI (smart replies / summarize / translate),
+// LiveKit call tokens, call push, and message / group / friend-request push.
+//
+// Needs only: express, firebase-admin, livekit-server-sdk (Node 18+).
+//
+// Render environment variables used:
+//   APP_SHARED_SECRET          must match --dart-define=APP_SHARED_SECRET in the app
+//   ANTHROPIC_API_KEY          for the AI features
+//   LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL
+//   FIREBASE_SERVICE_ACCOUNT   the service-account JSON (as text)
 
 const express = require('express');
-const Anthropic = require('@anthropic-ai/sdk');
-const { AccessToken } = require('livekit-server-sdk');
+const crypto = require('crypto');
 const admin = require('firebase-admin');
+const { AccessToken } = require('livekit-server-sdk');
 
+const PORT = process.env.PORT || 3000;
+const APP_SECRET = process.env.APP_SHARED_SECRET || process.env.APP_SECRET || '';
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '';
+const AI_MODEL = process.env.AI_MODEL || 'claude-haiku-4-5-20251001';
+const LK_KEY = process.env.LIVEKIT_API_KEY || '';
+const LK_SECRET = process.env.LIVEKIT_API_SECRET || '';
+const LK_URL = process.env.LIVEKIT_URL || process.env.LIVEKIT_WS_URL || '';
+
+// ───────────────────────── Firebase ─────────────────────────
+let db = null;
+let fcm = null;
+try {
+  const raw = (process.env.FIREBASE_SERVICE_ACCOUNT || '').trim();
+  if (raw) {
+    const text = raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8');
+    const cred = JSON.parse(text);
+    if (cred.private_key) cred.private_key = cred.private_key.replace(/\\n/g, '\n');
+    admin.initializeApp({ credential: admin.credential.cert(cred) });
+    db = admin.firestore();
+    fcm = admin.messaging();
+    console.log('Firebase admin ready');
+  } else {
+    console.warn('FIREBASE_SERVICE_ACCOUNT is not set — push is disabled');
+  }
+} catch (e) {
+  console.error('Firebase init failed:', e.message);
+}
+
+// ───────────────────────── App ─────────────────────────
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-// ── Config — set these as environment variables on your host ────────────
-const APP_SHARED_SECRET = process.env.APP_SHARED_SECRET || 'CHANGE_ME';
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
-const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
-const LIVEKIT_WS_URL = process.env.LIVEKIT_WS_URL;
-// Whole Firebase service-account JSON (Firebase console → Project settings →
-// Service accounts → Generate new private key). Paste the file's contents as
-// one environment variable. Only needed for call push notifications.
-const FIREBASE_SERVICE_ACCOUNT = process.env.FIREBASE_SERVICE_ACCOUNT;
-
-let firebaseReady = false;
-if (FIREBASE_SERVICE_ACCOUNT) {
-  try {
-    admin.initializeApp({
-      credential: admin.credential.cert(JSON.parse(FIREBASE_SERVICE_ACCOUNT)),
-    });
-    firebaseReady = true;
-  } catch (e) {
-    console.error('FIREBASE_SERVICE_ACCOUNT is set but invalid:', e.message);
-  }
+function authorized(req) {
+  if (!APP_SECRET) return true;
+  const got = String(req.get('X-App-Secret') || (req.body && req.body.secret) || '');
+  const a = Buffer.from(got);
+  const b = Buffer.from(APP_SECRET);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
-
-// ── Shared auth — accepts the secret either as a header (used by
-// AiAssistService) or in the JSON body (used by the call screen), so both
-// parts of the Flutter app work against this one server unmodified. ──────
-function checkAuth(req, res, next) {
-  const headerSecret = req.get('X-App-Secret');
-  const bodySecret = req.body?.secret;
-  if (headerSecret !== APP_SHARED_SECRET && bodySecret !== APP_SHARED_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
-}
-
+app.get('/', (_req, res) => res.send('CLOVET backend'));
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// ═════════════════════════════════════════════════════════════════════════
-//  AI FEATURES — smart replies, summaries, translation
-// ═════════════════════════════════════════════════════════════════════════
-const AI_MODEL = 'claude-sonnet-4-5';
-
-app.post('/api/ai/smart-replies', checkAuth, async (req, res) => {
+// ───────────────────────── LiveKit token ─────────────────────────
+app.post('/livekit-token', async (req, res) => {
+  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
   try {
-    if (!anthropic) return res.status(500).json({ error: 'AI not configured' });
-    const messages = req.body.messages || [];
-    const transcript = messages
-      .slice(-15)
-      .map((m) => `${m.fromMe ? 'Me' : 'Them'}: ${m.text}`)
-      .join('\n');
-
-    const response = await anthropic.messages.create({
-      model: AI_MODEL,
-      max_tokens: 300,
-      system:
-        'You suggest short quick-reply chips for a chat app, like Gmail/WhatsApp smart replies. ' +
-        'Given the recent conversation, suggest 2-4 short replies (under 8 words each) the user ' +
-        'might want to send next, from "Me"\'s perspective. Reply with ONLY a JSON array of strings, ' +
-        'nothing else. Example: ["Sounds good!", "What time?", "Can\'t make it"]',
-      messages: [{ role: 'user', content: transcript || '(no messages yet)' }],
-    });
-
-    const text = response.content.find((b) => b.type === 'text')?.text ?? '[]';
-    let replies;
-    try {
-      replies = JSON.parse(text.trim());
-    } catch {
-      replies = [];
+    const { roomName, identity, participantName, displayName } = req.body || {};
+    const id = String(identity || participantName || '').trim();
+    if (!roomName || !id) return res.status(400).json({ error: 'roomName and identity required' });
+    if (!LK_KEY || !LK_SECRET || !LK_URL) {
+      return res.status(500).json({ error: 'LiveKit is not configured on the server' });
     }
-    res.json({ replies: Array.isArray(replies) ? replies.slice(0, 4) : [] });
+    const at = new AccessToken(LK_KEY, LK_SECRET, {
+      identity: id,
+      name: String(displayName || participantName || id),
+      ttl: '2h',
+    });
+    at.addGrant({
+      roomJoin: true,
+      room: String(roomName),
+      canPublish: true,
+      canSubscribe: true,
+    });
+    const token = await at.toJwt();
+    res.json({ token, url: LK_URL });
   } catch (e) {
-    console.error('smart-replies error:', e);
-    res.status(500).json({ error: 'Failed to generate smart replies' });
+    console.error('livekit-token:', e);
+    res.status(500).json({ error: 'token failed' });
   }
 });
 
-app.post('/api/ai/summarize', checkAuth, async (req, res) => {
-  try {
-    if (!anthropic) return res.status(500).json({ error: 'AI not configured' });
-    const messages = req.body.messages || [];
-    const transcript = messages
-      .map((m) => `${m.sender || (m.fromMe ? 'Me' : 'Them')}: ${m.text}`)
-      .join('\n');
-
-    const response = await anthropic.messages.create({
+// ───────────────────────── AI ─────────────────────────
+async function askClaude(system, userText, maxTokens) {
+  if (!ANTHROPIC_KEY) throw new Error('ANTHROPIC_API_KEY is not set');
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': ANTHROPIC_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
       model: AI_MODEL,
-      max_tokens: 400,
-      system:
-        'You summarize chat conversations so someone can quickly catch up. ' +
-        'Write a short summary (3-6 sentences, or bullet points for a busy group chat), ' +
-        'covering key points, decisions, and anything actionable. Plain text only, no headers.',
-      messages: [{ role: 'user', content: transcript || '(no messages yet)' }],
-    });
+      max_tokens: maxTokens || 300,
+      system,
+      messages: [{ role: 'user', content: userText }],
+    }),
+  });
+  if (!r.ok) throw new Error(`Anthropic ${r.status}: ${await r.text()}`);
+  const j = await r.json();
+  return (j.content || [])
+    .filter((b) => b.type === 'text')
+    .map((b) => b.text)
+    .join('')
+    .trim();
+}
 
-    const summary = response.content.find((b) => b.type === 'text')?.text ?? null;
+function transcript(messages, limit) {
+  const list = Array.isArray(messages) ? messages.slice(-limit) : [];
+  return list
+    .map((m) => {
+      const who = m.sender ? String(m.sender) : m.fromMe ? 'Me' : 'Them';
+      return `${who}: ${String(m.text || '').slice(0, 500)}`;
+    })
+    .filter((l) => !l.endsWith(': '))
+    .join('\n');
+}
+
+app.post('/api/ai/smart-replies', async (req, res) => {
+  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const convo = transcript(req.body && req.body.messages, 12);
+    if (!convo) return res.json({ replies: [] });
+    const out = await askClaude(
+      'You suggest quick chat replies. Given a conversation, write 3 short, natural replies (max 8 words each) that "Me" could send next. ' +
+        'Match the language of the conversation. Reply with ONLY a JSON array of strings, nothing else.',
+      convo,
+      200
+    );
+    let replies = [];
+    try {
+      const start = out.indexOf('[');
+      const end = out.lastIndexOf(']');
+      replies = JSON.parse(out.slice(start, end + 1));
+    } catch (_) {
+      replies = out.split('\n').map((s) => s.replace(/^[-*\d.\s"]+|"+,?$/g, '').trim()).filter(Boolean);
+    }
+    replies = replies.filter((s) => typeof s === 'string' && s.trim()).slice(0, 4);
+    res.json({ replies });
+  } catch (e) {
+    console.error('smart-replies:', e.message);
+    res.status(500).json({ error: 'failed' });
+  }
+});
+
+app.post('/api/ai/summarize', async (req, res) => {
+  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const convo = transcript(req.body && req.body.messages, 80);
+    if (!convo) return res.json({ summary: 'Nothing to summarize yet.' });
+    const summary = await askClaude(
+      'Summarize this chat so someone can catch up quickly. Be brief (2-5 short sentences or bullets), mention who said what when it matters, ' +
+        'and use the language of the conversation.',
+      convo,
+      400
+    );
     res.json({ summary });
   } catch (e) {
-    console.error('summarize error:', e);
-    res.status(500).json({ error: 'Failed to summarize' });
+    console.error('summarize:', e.message);
+    res.status(500).json({ error: 'failed' });
   }
 });
 
-app.post('/api/ai/translate', checkAuth, async (req, res) => {
+app.post('/api/ai/translate', async (req, res) => {
+  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
   try {
-    if (!anthropic) return res.status(500).json({ error: 'AI not configured' });
-    const { text, targetLanguage } = req.body;
-    if (!text || !targetLanguage) {
-      return res.status(400).json({ error: 'text and targetLanguage are required' });
-    }
-
-    const response = await anthropic.messages.create({
-      model: AI_MODEL,
-      max_tokens: 500,
-      system:
-        `Translate the user's message into ${targetLanguage}. ` +
-        'Reply with ONLY the translated text, nothing else — no quotes, no explanation.',
-      messages: [{ role: 'user', content: text }],
-    });
-
-    const translated = response.content.find((b) => b.type === 'text')?.text?.trim() ?? null;
+    const { text, targetLanguage } = req.body || {};
+    if (!text || !targetLanguage) return res.status(400).json({ error: 'text and targetLanguage required' });
+    const translated = await askClaude(
+      `Translate the user's message into ${String(targetLanguage).slice(0, 40)}. Reply with ONLY the translation, no quotes or notes.`,
+      String(text).slice(0, 2000),
+      600
+    );
     res.json({ translated });
   } catch (e) {
-    console.error('translate error:', e);
-    res.status(500).json({ error: 'Failed to translate' });
+    console.error('translate:', e.message);
+    res.status(500).json({ error: 'failed' });
   }
 });
 
-// ═════════════════════════════════════════════════════════════════════════
-//  CALLS — LiveKit access tokens
-// ═════════════════════════════════════════════════════════════════════════
-app.post('/livekit-token', checkAuth, async (req, res) => {
+// ───────────────────────── Push helpers ─────────────────────────
+const recentlySent = new Map(); // dedupe key -> time
+function firstTime(key) {
+  const now = Date.now();
+  for (const [k, t] of recentlySent) if (now - t > 10 * 60 * 1000) recentlySent.delete(k);
+  if (recentlySent.has(key)) return false;
+  recentlySent.set(key, now);
+  return true;
+}
+
+function clip(s, n) {
+  s = String(s || '').replace(/\s+/g, ' ').trim();
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
+function strMap(o) {
+  const out = {};
+  for (const k of Object.keys(o || {})) out[k] = String(o[k] == null ? '' : o[k]);
+  return out;
+}
+
+async function nameOf(uid) {
   try {
-    const { roomName, participantName, identity, displayName } = req.body || {};
-    if (!roomName || !participantName) {
-      return res.status(400).json({ error: 'roomName and participantName are required' });
-    }
-    if (!LIVEKIT_API_KEY || !LIVEKIT_API_SECRET || !LIVEKIT_WS_URL) {
-      return res.status(500).json({ error: 'Server is missing LiveKit configuration' });
-    }
+    const d = await db.collection('publicUsers').doc(uid).get();
+    const n = d.exists ? (d.data().name || '').toString().trim() : '';
+    return n || 'CLOVET user';
+  } catch (_) {
+    return 'CLOVET user';
+  }
+}
 
-    const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
-      // The app sends the user's id as `identity` so each person is unique
-      // and the app can map them back to a contact name.
-      identity: String(identity || `${participantName}_${Date.now()}`),
-      name: String(displayName || participantName),
-      ttl: '6h',
-    });
-    at.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true });
-
-    const token = await at.toJwt();
-    res.json({ token, url: LIVEKIT_WS_URL });
+// kind 'call' rings loudly on the "calls" channel; everything else is a
+// high-importance heads-up banner on the "messages" channel.
+async function sendToUser(uid, { title, body, kind, data }) {
+  if (!fcm || !db || !uid) return false;
+  let token = null;
+  try {
+    const d = await db.collection('fcmTokens').doc(uid).get();
+    token = d.exists ? d.data().token : null;
   } catch (e) {
-    console.error('livekit-token error:', e);
-    res.status(500).json({ error: 'Failed to issue token' });
+    console.error('token read:', e.message);
   }
-});
-
-// ═════════════════════════════════════════════════════════════════════════
-//  PUSH — rings a closed phone. The app sends only a callId; everything else
-//  (who to ring, who's calling) is read from the real call record in
-//  Firestore, so this can't be used to send arbitrary notifications.
-// ═════════════════════════════════════════════════════════════════════════
-app.post('/api/push/call', checkAuth, async (req, res) => {
-  try {
-    if (!firebaseReady) {
-      return res.status(500).json({ error: 'Push not configured (FIREBASE_SERVICE_ACCOUNT missing or invalid)' });
-    }
-    const callId = String(req.body?.callId || '');
-    if (!callId) return res.status(400).json({ error: 'callId is required' });
-
-    const db = admin.firestore();
-    const snap = await db.collection('calls').doc(callId).get();
-    if (!snap.exists) return res.json({ sent: 0, reason: 'no such call' });
-    const call = snap.data();
-    if (call.status !== 'ringing') return res.json({ sent: 0, reason: 'not ringing' });
-    const created = call.createdAt?.toMillis?.() ?? 0;
-    if (Date.now() - created > 60 * 1000) return res.json({ sent: 0, reason: 'stale' });
-
-    const calleeIds = (call.calleeIds || []).slice(0, 50);
-    const docs = await Promise.all(calleeIds.map((id) => db.collection('fcmTokens').doc(id).get()));
-    const entries = docs
-      .filter((d) => d.exists && d.data().token)
-      .map((d) => ({ id: d.id, token: d.data().token }));
-    if (entries.length === 0) return res.json({ sent: 0, reason: 'no tokens' });
-
-    const caller = call.callerName || 'Someone';
-    const kind = call.isVideo ? 'video' : 'voice';
-    const response = await admin.messaging().sendEachForMulticast({
-      tokens: entries.map((e) => e.token),
+  if (!token) return false;
+  const isCall = kind === 'call';
+  const message = {
+    token,
+    notification: { title: clip(title, 80), body: clip(body, 180) },
+    data: strMap(data),
+    android: {
+      priority: 'high',
+      ...(isCall ? { ttl: 45000 } : {}),
       notification: {
-        title: call.isGroup ? `${call.title || 'Group'} call` : `${caller} is calling`,
-        body: `Incoming ${kind} call — tap to answer`,
+        channelId: isCall ? 'calls' : 'messages',
+        sound: 'default',
+        priority: isCall ? 'max' : 'high',
+        visibility: 'public',
+        defaultVibrateTimings: true,
       },
-      data: { type: 'call', callId },
-      android: {
-        priority: 'high',
-        ttl: 45000,
-        notification: { sound: 'default', tag: `call_${callId}`, visibility: 'public' },
-      },
-    });
-
-    // Remove tokens that are no longer valid (app uninstalled, etc.).
-    await Promise.all(
-      response.responses.map((r, i) => {
-        const code = r.error?.code;
-        if (code === 'messaging/registration-token-not-registered' ||
-            code === 'messaging/invalid-registration-token') {
-          return db.collection('fcmTokens').doc(entries[i].id).delete().catch(() => {});
-        }
-        return null;
-      })
-    );
-
-    res.json({ sent: response.successCount, failed: response.failureCount });
+    },
+    apns: {
+      headers: { 'apns-priority': '10' },
+      payload: { aps: { sound: 'default' } },
+    },
+  };
+  try {
+    await fcm.send(message);
+    return true;
   } catch (e) {
-    console.error('push/call error:', e);
-    res.status(500).json({ error: 'Failed to send push' });
+    const code = e && e.code ? String(e.code) : '';
+    console.error('fcm send:', code || e.message);
+    if (code.includes('registration-token-not-registered') || code.includes('invalid-registration-token')) {
+      db.collection('fcmTokens').doc(uid).delete().catch(() => {});
+    }
+    return false;
+  }
+}
+
+function previewFor(m) {
+  const t = String(m.msgType || 'text');
+  const caption = m.caption ? ` ${m.caption}` : '';
+  switch (t) {
+    case 'image': return '📷 Photo' + caption;
+    case 'video': return '🎥 Video' + caption;
+    case 'voice': return '🎤 Voice message';
+    case 'audio': return '🎵 Audio';
+    case 'document':
+    case 'file': return '📄 ' + (m.fileName || 'File');
+    case 'poll': return '📊 Poll: ' + (m.text || '');
+    default: return m.text || 'New message';
+  }
+}
+
+function isFresh(ts, maxMs) {
+  if (!ts || typeof ts.toMillis !== 'function') return true;
+  return Date.now() - ts.toMillis() <= maxMs;
+}
+
+// ───────────────────────── Call push ─────────────────────────
+async function handleCallPush(callId) {
+  const snap = await db.collection('calls').doc(callId).get();
+  if (!snap.exists) return;
+  const c = snap.data();
+  if (c.status !== 'ringing') return;
+  if (!isFresh(c.createdAt, 60 * 1000)) return;
+  if (!firstTime('call:' + callId)) return;
+  const isVideo = c.isVideo === true;
+  const kindText = isVideo ? 'Video call' : 'Voice call';
+  const callerName = c.callerName || (await nameOf(c.callerId));
+  const title = c.isGroup ? `${callerName} started a group call` : `${callerName} is calling`;
+  const body = c.isGroup && c.title ? `${c.title} · ${kindText}` : `Incoming ${kindText.toLowerCase()}`;
+  const callees = Array.isArray(c.calleeIds) ? c.calleeIds : [];
+  await Promise.all(
+    callees
+      .filter((u) => u && u !== c.callerId)
+      .map((u) => sendToUser(u, { title, body, kind: 'call', data: { type: 'call', callId } }))
+  );
+}
+
+app.post('/api/push/call', async (req, res) => {
+  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
+  const callId = String((req.body && req.body.callId) || '').trim();
+  if (!callId) return res.status(400).json({ error: 'callId required' });
+  if (!db) return res.status(503).json({ error: 'push not configured' });
+  res.json({ ok: true });
+  try {
+    await handleCallPush(callId);
+  } catch (e) {
+    console.error('push/call:', e.message);
   }
 });
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`CLOVET backend listening on :${PORT}`);
+// ───────────────────────── Message / group / friend push ─────────────────────────
+async function handleEvent(ev) {
+  const type = String(ev.type || '');
+  const id = String(ev.id || '').trim();
+  if (!id) return;
+
+  if (type === 'chat') {
+    const chatId = String(ev.chatId || '').trim();
+    if (!chatId || !firstTime(`chat:${chatId}:${id}`)) return;
+    const s = await db.collection('chats').doc(chatId).collection('messages').doc(id).get();
+    if (!s.exists) return;
+    const m = s.data();
+    if (!m.from || !m.to || m.from === m.to) return;
+    if (!isFresh(m.createdAt, 10 * 60 * 1000)) return;
+    const sender = await nameOf(m.from);
+    await sendToUser(m.to, {
+      title: sender,
+      body: previewFor(m),
+      kind: 'message',
+      data: { type: 'chat', chatId, from: m.from, messageId: id },
+    });
+    return;
+  }
+
+  if (type === 'group') {
+    const groupId = String(ev.groupId || '').trim();
+    if (!groupId || !firstTime(`group:${groupId}:${id}`)) return;
+    const gs = await db.collection('groups').doc(groupId).get();
+    if (!gs.exists) return;
+    const g = gs.data();
+    const members = Array.isArray(g.memberIds) ? g.memberIds : [];
+    const ms = await db.collection('groups').doc(groupId).collection('messages').doc(id).get();
+    if (!ms.exists) return;
+    const m = ms.data();
+    if (!m.from || !members.includes(m.from)) return;
+    if (!isFresh(m.createdAt, 10 * 60 * 1000)) return;
+    const sender = await nameOf(m.from);
+    const groupName = g.name || 'Group';
+    await Promise.all(
+      members
+        .filter((u) => u && u !== m.from)
+        .map((u) =>
+          sendToUser(u, {
+            title: groupName,
+            body: `${sender}: ${previewFor(m)}`,
+            kind: 'message',
+            data: { type: 'group', groupId, from: m.from, messageId: id },
+          })
+        )
+    );
+    return;
+  }
+
+  if (type === 'friendRequest' || type === 'friendAccepted') {
+    if (!firstTime(`${type}:${id}`)) return;
+    const s = await db.collection('friendRequests').doc(id).get();
+    if (!s.exists) return;
+    const r = s.data();
+    if (type === 'friendRequest') {
+      if (r.status !== 'pending' || !r.to) return;
+      await sendToUser(r.to, {
+        title: 'New friend request',
+        body: `${r.fromName || 'Someone'} sent you a friend request`,
+        kind: 'message',
+        data: { type: 'friendRequest', requestId: id, from: r.from },
+      });
+    } else {
+      if (r.status !== 'accepted' || !r.from) return;
+      await sendToUser(r.from, {
+        title: 'Friend request accepted',
+        body: `${r.toName || 'Someone'} accepted your friend request`,
+        kind: 'message',
+        data: { type: 'friendAccepted', requestId: id, from: r.to },
+      });
+    }
+  }
+}
+
+app.post('/api/push/event', async (req, res) => {
+  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
+  if (!db) return res.status(503).json({ error: 'push not configured' });
+  res.json({ ok: true });
+  try {
+    await handleEvent(req.body || {});
+  } catch (e) {
+    console.error('push/event:', e.message);
+  }
 });
+
+app.listen(PORT, () => console.log(`CLOVET backend listening on ${PORT}`));
