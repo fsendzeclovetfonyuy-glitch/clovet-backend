@@ -336,7 +336,7 @@ async function handleEvent(ev) {
       title: sender,
       body: previewFor(m),
       kind: 'message',
-      data: { type: 'chat', chatId, from: m.from, messageId: id },
+      data: { type: 'chat', chatId, senderId: m.from, messageId: id },
     });
     return;
   }
@@ -363,7 +363,7 @@ async function handleEvent(ev) {
             title: groupName,
             body: `${sender}: ${previewFor(m)}`,
             kind: 'message',
-            data: { type: 'group', groupId, from: m.from, messageId: id },
+            data: { type: 'group', groupId, senderId: m.from, messageId: id },
           })
         )
     );
@@ -381,7 +381,7 @@ async function handleEvent(ev) {
         title: 'New friend request',
         body: `${r.fromName || 'Someone'} sent you a friend request`,
         kind: 'message',
-        data: { type: 'friendRequest', requestId: id, from: r.from },
+        data: { type: 'friendRequest', requestId: id, senderId: r.from },
       });
     } else {
       if (r.status !== 'accepted' || !r.from) return;
@@ -389,7 +389,7 @@ async function handleEvent(ev) {
         title: 'Friend request accepted',
         body: `${r.toName || 'Someone'} accepted your friend request`,
         kind: 'message',
-        data: { type: 'friendAccepted', requestId: id, from: r.to },
+        data: { type: 'friendAccepted', requestId: id, senderId: r.to },
       });
     }
   }
