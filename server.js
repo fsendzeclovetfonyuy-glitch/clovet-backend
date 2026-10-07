@@ -230,26 +230,44 @@ async function sendToUser(uid, { title, body, kind, data }) {
   }
   if (!token) return false;
   const isCall = kind === 'call';
-  const message = {
-    token,
-    notification: { title: clip(title, 80), body: clip(body, 180) },
-    data: strMap(data),
-    android: {
-      priority: 'high',
-      ...(isCall ? { ttl: 45000 } : {}),
-      notification: {
-        channelId: isCall ? 'calls' : 'messages',
-        sound: 'default',
-        priority: isCall ? 'max' : 'high',
-        visibility: 'public',
-        defaultVibrateTimings: true,
-      },
-    },
-    apns: {
-      headers: { 'apns-priority': '10' },
-      payload: { aps: { sound: 'default' } },
-    },
-  };
+  // Calls go out as DATA-ONLY pushes so the phone's native code can raise a
+  // full-screen call screen. Set CALL_PUSH_MODE=banner on Render to fall back
+  // to the old ringing banner if that ever misbehaves.
+  const callAsData = isCall && process.env.CALL_PUSH_MODE !== 'banner';
+  const message = callAsData
+    ? {
+        token,
+        data: strMap({
+          ...data,
+          callTitle: clip(title, 80),
+          callBody: clip(body, 180),
+        }),
+        android: { priority: 'high', ttl: 45000 },
+        apns: {
+          headers: { 'apns-priority': '10' },
+          payload: { aps: { alert: { title: clip(title, 80), body: clip(body, 180) }, sound: 'default' } },
+        },
+      }
+    : {
+        token,
+        notification: { title: clip(title, 80), body: clip(body, 180) },
+        data: strMap(data),
+        android: {
+          priority: 'high',
+          ...(isCall ? { ttl: 45000 } : {}),
+          notification: {
+            channelId: isCall ? 'calls' : 'messages',
+            sound: 'default',
+            priority: isCall ? 'max' : 'high',
+            visibility: 'public',
+            defaultVibrateTimings: true,
+          },
+        },
+        apns: {
+          headers: { 'apns-priority': '10' },
+          payload: { aps: { sound: 'default' } },
+        },
+      };
   try {
     await fcm.send(message);
     return true;
@@ -300,7 +318,7 @@ async function handleCallPush(callId) {
   await Promise.all(
     callees
       .filter((u) => u && u !== c.callerId)
-      .map((u) => sendToUser(u, { title, body, kind: 'call', data: { type: 'call', callId } }))
+      .map((u) => sendToUser(u, { title, body, kind: 'call', data: { type: 'call', callId, isVideo: isVideo ? '1' : '0' } }))
   );
 }
 
