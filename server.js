@@ -371,10 +371,13 @@ async function handleEvent(ev) {
   }
 
   if (type === 'friendRequest' || type === 'friendAccepted') {
-    if (!firstTime(`${type}:${id}`)) return;
     const s = await db.collection('friendRequests').doc(id).get();
     if (!s.exists) return;
     const r = s.data();
+    // The request id is the same every time the same two people re-request,
+    // so the dedupe key includes its created time.
+    const stamp = r.createdAt && typeof r.createdAt.toMillis === 'function' ? r.createdAt.toMillis() : 0;
+    if (!firstTime(`${type}:${id}:${stamp}`)) return;
     if (type === 'friendRequest') {
       if (r.status !== 'pending' || !r.to) return;
       await sendToUser(r.to, {
