@@ -242,7 +242,7 @@ async function sendToUser(uid, { title, body, kind, data }) {
           callTitle: clip(title, 80),
           callBody: clip(body, 180),
         }),
-        android: { priority: 'high', ttl: 45000 },
+        android: { priority: 'high', ttl: 90000 },
         apns: {
           headers: { 'apns-priority': '10' },
           payload: { aps: { alert: { title: clip(title, 80), body: clip(body, 180) }, sound: 'default' } },
@@ -254,7 +254,7 @@ async function sendToUser(uid, { title, body, kind, data }) {
         data: strMap(data),
         android: {
           priority: 'high',
-          ...(isCall ? { ttl: 45000 } : {}),
+          ...(isCall ? { ttl: 90000 } : {}),
           notification: {
             channelId: isCall ? 'calls' : 'messages',
             sound: 'default',
@@ -307,7 +307,7 @@ async function handleCallPush(callId) {
   if (!snap.exists) return;
   const c = snap.data();
   if (c.status !== 'ringing') return;
-  if (!isFresh(c.createdAt, 60 * 1000)) return;
+  if (!isFresh(c.createdAt, 150 * 1000)) return;
   if (!firstTime('call:' + callId)) return;
   const isVideo = c.isVideo === true;
   const kindText = isVideo ? 'Video call' : 'Voice call';
@@ -315,11 +315,12 @@ async function handleCallPush(callId) {
   const title = c.isGroup ? `${callerName} started a group call` : `${callerName} is calling`;
   const body = c.isGroup && c.title ? `${c.title} · ${kindText}` : `Incoming ${kindText.toLowerCase()}`;
   const callees = Array.isArray(c.calleeIds) ? c.calleeIds : [];
-  await Promise.all(
+  const results = await Promise.all(
     callees
       .filter((u) => u && u !== c.callerId)
       .map((u) => sendToUser(u, { title, body, kind: 'call', data: { type: 'call', callId, isVideo: isVideo ? '1' : '0' } }))
   );
+  console.log(`call push ${callId}: delivered to ${results.filter(Boolean).length}/${results.length}`);
 }
 
 app.post('/api/push/call', async (req, res) => {
