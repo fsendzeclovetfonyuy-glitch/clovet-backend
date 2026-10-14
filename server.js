@@ -1,431 +1,414 @@
 'use strict';
-// CLOVET backend — one server for: AI (smart replies / summarize / translate),
-// LiveKit call tokens, call push, and message / group / friend-request push.
-//
-// Needs only: express, firebase-admin, livekit-server-sdk (Node 18+).
-//
-// Render environment variables used:
-//   APP_SHARED_SECRET          must match --dart-define=APP_SHARED_SECRET in the app
-//   ANTHROPIC_API_KEY          for the AI features
-//   LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL
-//   FIREBASE_SERVICE_ACCOUNT   the service-account JSON (as text)
+// CLOVET backend — one server for: call pushes, message pushes, LiveKit tokens
+// and the AI helpers. Deploy by replacing server.js and package.json on GitHub.
 
-const express = require('express');
 const crypto = require('crypto');
-const admin = require('firebase-admin');
-const { AccessToken } = require('livekit-server-sdk');
+const express = require('express');
+const cors = require('cors');
 
-const PORT = process.env.PORT || 3000;
-const APP_SECRET = process.env.APP_SHARED_SECRET || process.env.APP_SECRET || '';
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY || '';
-const AI_MODEL = process.env.AI_MODEL || 'claude-haiku-4-5-20251001';
-const LK_KEY = process.env.LIVEKIT_API_KEY || '';
-const LK_SECRET = process.env.LIVEKIT_API_SECRET || '';
-const LK_URL = process.env.LIVEKIT_URL || process.env.LIVEKIT_WS_URL || '';
+// ── Environment ─────────────────────────────────────────────────────────────
+const SECRET = process.env.APP_SHARED_SECRET || '';
+const LIVEKIT_URL = process.env.LIVEKIT_URL || '';
+const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || '';
+const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || '';
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5';
 
-// ───────────────────────── Firebase ─────────────────────────
+for (const name of [
+  'APP_SHARED_SECRET',
+  'FIREBASE_SERVICE_ACCOUNT',
+  'LIVEKIT_URL',
+  'LIVEKIT_API_KEY',
+  'LIVEKIT_API_SECRET',
+  'ANTHROPIC_API_KEY',
+]) {
+  if (!process.env[name]) console.error(`MISSING environment variable: ${name}`);
+}
+
+// ── Firebase admin ──────────────────────────────────────────────────────────
+let admin = null;
 let db = null;
 let fcm = null;
 try {
-  const raw = (process.env.FIREBASE_SERVICE_ACCOUNT || '').trim();
-  if (raw) {
-    const text = raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8');
-    const cred = JSON.parse(text);
-    if (cred.private_key) cred.private_key = cred.private_key.replace(/\\n/g, '\n');
-    admin.initializeApp({ credential: admin.credential.cert(cred) });
-    db = admin.firestore();
-    fcm = admin.messaging();
-    console.log('Firebase admin ready');
-  } else {
-    console.warn('FIREBASE_SERVICE_ACCOUNT is not set — push is disabled');
-  }
+  admin = require('firebase-admin');
+  let raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!raw) throw new Error('FIREBASE_SERVICE_ACCOUNT is not set');
+  raw = raw.trim();
+  if (!raw.startsWith('{')) raw = Buffer.from(raw, 'base64').toString('utf8');
+  const sa = JSON.parse(raw);
+  if (sa.private_key) sa.private_key = sa.private_key.replace(/\\n/g, '\n');
+  admin.initializeApp({ credential: admin.credential.cert(sa) });
+  db = admin.firestore();
+  fcm = admin.messaging();
+  console.log('Firebase admin ready');
 } catch (e) {
-  console.error('Firebase init failed:', e.message);
+  console.error('Firebase admin NOT ready:', e.message);
 }
 
-// ───────────────────────── App ─────────────────────────
-const app = express();
-app.use(express.json({ limit: '2mb' }));
+// ── Small helpers ───────────────────────────────────────────────────────────
+const str = (v) => (v === undefined || v === null ? '' : String(v));
 
-function authorized(req) {
-  if (!APP_SECRET) return true;
-  const got = String(req.get('X-App-Secret') || (req.body && req.body.secret) || '');
-  const a = Buffer.from(got);
-  const b = Buffer.from(APP_SECRET);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+function safeEqual(a, b) {
+  const x = Buffer.from(str(a));
+  const y = Buffer.from(str(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
 }
 
-app.get('/', (_req, res) => res.send('CLOVET backend'));
-app.get('/health', (_req, res) => res.json({ ok: true }));
+function authed(req) {
+  if (!SECRET) return false;
+  const given = (req.body && req.body.secret) || req.get('X-App-Secret') || '';
+  return safeEqual(given, SECRET);
+}
 
-// ───────────────────────── LiveKit token ─────────────────────────
-app.post('/livekit-token', async (req, res) => {
-  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
+function requireAuth(req, res, next) {
+  if (!authed(req)) return res.status(401).json({ error: 'unauthorized' });
+  next();
+}
+
+function requireFirebase(req, res, next) {
+  if (!db || !fcm) return res.status(503).json({ error: 'firebase not ready' });
+  next();
+}
+
+// ── Push sending ────────────────────────────────────────────────────────────
+async function tokenFor(uid) {
+  if (!uid) return null;
+  const snap = await db.collection('fcmTokens').doc(uid).get();
+  return snap.exists ? snap.data().token || null : null;
+}
+
+// Returns 'ok' | 'no-token' | 'failed'. Never throws.
+async function sendPush(uid, message) {
   try {
-    const { roomName, identity, participantName, displayName } = req.body || {};
-    const id = String(identity || participantName || '').trim();
-    if (!roomName || !id) return res.status(400).json({ error: 'roomName and identity required' });
-    if (!LK_KEY || !LK_SECRET || !LK_URL) {
-      return res.status(500).json({ error: 'LiveKit is not configured on the server' });
+    const token = await tokenFor(uid);
+    if (!token) return 'no-token';
+    await fcm.send({ token, ...message });
+    return 'ok';
+  } catch (e) {
+    console.error(`fcm send to ${uid}: ${e.code || ''} ${e.message}`);
+    if (
+      e.code === 'messaging/registration-token-not-registered' ||
+      e.code === 'messaging/invalid-registration-token'
+    ) {
+      db.collection('fcmTokens')
+        .doc(uid)
+        .set({ token: admin.firestore.FieldValue.delete() }, { merge: true })
+        .catch(() => {});
     }
-    const at = new AccessToken(LK_KEY, LK_SECRET, {
-      identity: id,
-      name: String(displayName || participantName || id),
-      ttl: '2h',
-    });
-    at.addGrant({
-      roomJoin: true,
-      room: String(roomName),
-      canPublish: true,
-      canSubscribe: true,
-    });
-    const token = await at.toJwt();
-    res.json({ token, url: LK_URL });
-  } catch (e) {
-    console.error('livekit-token:', e);
-    res.status(500).json({ error: 'token failed' });
+    return 'failed';
   }
-});
-
-// ───────────────────────── AI ─────────────────────────
-async function askClaude(system, userText, maxTokens) {
-  if (!ANTHROPIC_KEY) throw new Error('ANTHROPIC_API_KEY is not set');
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': ANTHROPIC_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: AI_MODEL,
-      max_tokens: maxTokens || 300,
-      system,
-      messages: [{ role: 'user', content: userText }],
-    }),
-  });
-  if (!r.ok) throw new Error(`Anthropic ${r.status}: ${await r.text()}`);
-  const j = await r.json();
-  return (j.content || [])
-    .filter((b) => b.type === 'text')
-    .map((b) => b.text)
-    .join('')
-    .trim();
 }
 
-function transcript(messages, limit) {
-  const list = Array.isArray(messages) ? messages.slice(-limit) : [];
-  return list
-    .map((m) => {
-      const who = m.sender ? String(m.sender) : m.fromMe ? 'Me' : 'Them';
-      return `${who}: ${String(m.text || '').slice(0, 500)}`;
-    })
-    .filter((l) => !l.endsWith(': '))
-    .join('\n');
+// Calls are data-only, high priority: the phone's own CLOVET code (not the
+// system) decides how to ring, so it works with the app closed or locked.
+function callData(callId, d) {
+  return {
+    type: 'call',
+    callId,
+    callerId: str(d.callerId),
+    callerName: str(d.callerName),
+    isVideo: d.isVideo === true ? 'true' : 'false',
+    isGroup: d.isGroup === true ? 'true' : 'false',
+    title: str(d.title),
+  };
 }
 
-app.post('/api/ai/smart-replies', async (req, res) => {
-  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
-  try {
-    const convo = transcript(req.body && req.body.messages, 12);
-    if (!convo) return res.json({ replies: [] });
-    const out = await askClaude(
-      'You suggest quick chat replies. Given a conversation, write 3 short, natural replies (max 8 words each) that "Me" could send next. ' +
-        'Match the language of the conversation. Reply with ONLY a JSON array of strings, nothing else.',
-      convo,
-      200
-    );
-    let replies = [];
-    try {
-      const start = out.indexOf('[');
-      const end = out.lastIndexOf(']');
-      replies = JSON.parse(out.slice(start, end + 1));
-    } catch (_) {
-      replies = out.split('\n').map((s) => s.replace(/^[-*\d.\s"]+|"+,?$/g, '').trim()).filter(Boolean);
-    }
-    replies = replies.filter((s) => typeof s === 'string' && s.trim()).slice(0, 4);
-    res.json({ replies });
-  } catch (e) {
-    console.error('smart-replies:', e.message);
-    res.status(500).json({ error: 'failed' });
+function chatPreview(msgType, text) {
+  switch (str(msgType).toLowerCase()) {
+    case 'image':
+      return '📷 Photo';
+    case 'video':
+      return '🎥 Video';
+    case 'voice':
+      return '🎤 Voice message';
+    case 'audio':
+      return '🎵 Audio';
+    case 'document':
+    case 'file':
+      return '📄 Document';
+    case 'poll':
+      return '📊 Poll';
+    default:
+      return str(text) || 'New message';
   }
-});
-
-app.post('/api/ai/summarize', async (req, res) => {
-  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
-  try {
-    const convo = transcript(req.body && req.body.messages, 80);
-    if (!convo) return res.json({ summary: 'Nothing to summarize yet.' });
-    const summary = await askClaude(
-      'Summarize this chat so someone can catch up quickly. Be brief (2-5 short sentences or bullets), mention who said what when it matters, ' +
-        'and use the language of the conversation.',
-      convo,
-      400
-    );
-    res.json({ summary });
-  } catch (e) {
-    console.error('summarize:', e.message);
-    res.status(500).json({ error: 'failed' });
-  }
-});
-
-app.post('/api/ai/translate', async (req, res) => {
-  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
-  try {
-    const { text, targetLanguage } = req.body || {};
-    if (!text || !targetLanguage) return res.status(400).json({ error: 'text and targetLanguage required' });
-    const translated = await askClaude(
-      `Translate the user's message into ${String(targetLanguage).slice(0, 40)}. Reply with ONLY the translation, no quotes or notes.`,
-      String(text).slice(0, 2000),
-      600
-    );
-    res.json({ translated });
-  } catch (e) {
-    console.error('translate:', e.message);
-    res.status(500).json({ error: 'failed' });
-  }
-});
-
-// ───────────────────────── Push helpers ─────────────────────────
-const recentlySent = new Map(); // dedupe key -> time
-function firstTime(key) {
-  const now = Date.now();
-  for (const [k, t] of recentlySent) if (now - t > 10 * 60 * 1000) recentlySent.delete(k);
-  if (recentlySent.has(key)) return false;
-  recentlySent.set(key, now);
-  return true;
-}
-
-function clip(s, n) {
-  s = String(s || '').replace(/\s+/g, ' ').trim();
-  return s.length > n ? s.slice(0, n - 1) + '…' : s;
-}
-
-function strMap(o) {
-  const out = {};
-  for (const k of Object.keys(o || {})) out[k] = String(o[k] == null ? '' : o[k]);
-  return out;
 }
 
 async function nameOf(uid) {
   try {
-    const d = await db.collection('publicUsers').doc(uid).get();
-    const n = d.exists ? (d.data().name || '').toString().trim() : '';
+    const s = await db.collection('publicUsers').doc(uid).get();
+    const n = s.exists ? str(s.data().name) : '';
     return n || 'CLOVET user';
   } catch (_) {
     return 'CLOVET user';
   }
 }
 
-// kind 'call' rings loudly on the "calls" channel; everything else is a
-// high-importance heads-up banner on the "messages" channel.
-async function sendToUser(uid, { title, body, kind, data }) {
-  if (!fcm || !db || !uid) return false;
-  let token = null;
+function notifyMessage(title, body, tag, data) {
+  return {
+    notification: { title: str(title), body: str(body).slice(0, 180) },
+    data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, str(v)])),
+    android: {
+      priority: 'high',
+      ttl: 24 * 3600 * 1000,
+      notification: { channelId: 'clovet_messages', tag: str(tag), sound: 'default' },
+    },
+  };
+}
+
+// ── App ─────────────────────────────────────────────────────────────────────
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
+
+app.get('/', (_req, res) => res.send('CLOVET backend'));
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// ── LiveKit token ───────────────────────────────────────────────────────────
+app.post('/livekit-token', requireAuth, async (req, res) => {
   try {
-    const d = await db.collection('fcmTokens').doc(uid).get();
-    token = d.exists ? d.data().token : null;
-  } catch (e) {
-    console.error('token read:', e.message);
-  }
-  if (!token) return false;
-  const isCall = kind === 'call';
-  // Calls go out as DATA-ONLY pushes so the phone's native code can raise a
-  // full-screen call screen. Set CALL_PUSH_MODE=banner on Render to fall back
-  // to the old ringing banner if that ever misbehaves.
-  const callAsData = isCall && process.env.CALL_PUSH_MODE !== 'banner';
-  const message = callAsData
-    ? {
-        token,
-        data: strMap({
-          ...data,
-          callTitle: clip(title, 80),
-          callBody: clip(body, 180),
-        }),
-        android: { priority: 'high', ttl: 90000 },
-        apns: {
-          headers: { 'apns-priority': '10' },
-          payload: { aps: { alert: { title: clip(title, 80), body: clip(body, 180) }, sound: 'default' } },
-        },
-      }
-    : {
-        token,
-        notification: { title: clip(title, 80), body: clip(body, 180) },
-        data: strMap(data),
-        android: {
-          priority: 'high',
-          ...(isCall ? { ttl: 90000 } : {}),
-          notification: {
-            channelId: isCall ? 'calls' : 'messages',
-            sound: 'default',
-            priority: isCall ? 'max' : 'high',
-            visibility: 'public',
-            defaultVibrateTimings: true,
-          },
-        },
-        apns: {
-          headers: { 'apns-priority': '10' },
-          payload: { aps: { sound: 'default' } },
-        },
-      };
-  try {
-    await fcm.send(message);
-    return true;
-  } catch (e) {
-    const code = e && e.code ? String(e.code) : '';
-    console.error('fcm send:', code || e.message);
-    if (code.includes('registration-token-not-registered') || code.includes('invalid-registration-token')) {
-      db.collection('fcmTokens').doc(uid).delete().catch(() => {});
+    if (!LIVEKIT_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
+      return res.status(500).json({ error: 'livekit not configured' });
     }
-    return false;
+    const { roomName, identity, participantName, displayName } = req.body || {};
+    const id = str(identity || participantName);
+    if (!roomName || !id) return res.status(400).json({ error: 'roomName and identity required' });
+    const { AccessToken } = require('livekit-server-sdk');
+    const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+      identity: id,
+      name: str(displayName || participantName || id),
+      ttl: '2h',
+    });
+    at.addGrant({ roomJoin: true, room: str(roomName), canPublish: true, canSubscribe: true });
+    const token = await at.toJwt();
+    res.json({ token, url: LIVEKIT_URL });
+  } catch (e) {
+    console.error('livekit-token:', e.message);
+    res.status(500).json({ error: 'token failed' });
   }
-}
+});
 
-function previewFor(m) {
-  const t = String(m.msgType || 'text');
-  const caption = m.caption ? ` ${m.caption}` : '';
-  switch (t) {
-    case 'image': return '📷 Photo' + caption;
-    case 'video': return '🎥 Video' + caption;
-    case 'voice': return '🎤 Voice message';
-    case 'audio': return '🎵 Audio';
-    case 'document':
-    case 'file': return '📄 ' + (m.fileName || 'File');
-    case 'poll': return '📊 Poll: ' + (m.text || '');
-    default: return m.text || 'New message';
-  }
-}
-
-function isFresh(ts, maxMs) {
-  if (!ts || typeof ts.toMillis !== 'function') return true;
-  return Date.now() - ts.toMillis() <= maxMs;
-}
-
-// ───────────────────────── Call push ─────────────────────────
-async function handleCallPush(callId) {
-  const snap = await db.collection('calls').doc(callId).get();
-  if (!snap.exists) return;
-  const c = snap.data();
-  if (c.status !== 'ringing') return;
-  if (!isFresh(c.createdAt, 150 * 1000)) return;
-  if (!firstTime('call:' + callId)) return;
-  const isVideo = c.isVideo === true;
-  const kindText = isVideo ? 'Video call' : 'Voice call';
-  const callerName = c.callerName || (await nameOf(c.callerId));
-  const title = c.isGroup ? `${callerName} started a group call` : `${callerName} is calling`;
-  const body = c.isGroup && c.title ? `${c.title} · ${kindText}` : `Incoming ${kindText.toLowerCase()}`;
-  const callees = Array.isArray(c.calleeIds) ? c.calleeIds : [];
-  const results = await Promise.all(
-    callees
-      .filter((u) => u && u !== c.callerId)
-      .map((u) => sendToUser(u, { title, body, kind: 'call', data: { type: 'call', callId, isVideo: isVideo ? '1' : '0' } }))
-  );
-  console.log(`call push ${callId}: delivered to ${results.filter(Boolean).length}/${results.length}`);
-}
-
-app.post('/api/push/call', async (req, res) => {
-  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
-  const callId = String((req.body && req.body.callId) || '').trim();
-  if (!callId) return res.status(400).json({ error: 'callId required' });
-  if (!db) return res.status(503).json({ error: 'push not configured' });
-  res.json({ ok: true });
+// ── Call push: wake every phone being called ────────────────────────────────
+app.post('/api/push/call', requireAuth, requireFirebase, async (req, res) => {
   try {
-    await handleCallPush(callId);
+    const callId = str(req.body && req.body.callId);
+    if (!callId) return res.status(400).json({ error: 'callId required' });
+    const snap = await db.collection('calls').doc(callId).get();
+    if (!snap.exists) return res.status(404).json({ error: 'call not found' });
+    const d = snap.data();
+    if (d.status !== 'ringing') return res.json({ ok: true, skipped: 'not ringing' });
+    const ids = (Array.isArray(d.calleeIds) ? d.calleeIds : []).filter((u) => u && u !== d.callerId);
+    const message = {
+      data: callData(callId, d),
+      android: { priority: 'high', ttl: 45 * 1000 },
+    };
+    const results = await Promise.all(ids.map((uid) => sendPush(uid, message)));
+    const sent = results.filter((r) => r === 'ok').length;
+    console.log(`call ${callId}: pushed ${sent}/${ids.length} (${results.join(',')})`);
+    res.json({ ok: true, sent, total: ids.length });
   } catch (e) {
     console.error('push/call:', e.message);
+    res.status(500).json({ error: 'push failed' });
   }
 });
 
-// ───────────────────────── Message / group / friend push ─────────────────────────
-async function handleEvent(ev) {
-  const type = String(ev.type || '');
-  const id = String(ev.id || '').trim();
-  if (!id) return;
-
-  if (type === 'chat') {
-    const chatId = String(ev.chatId || '').trim();
-    if (!chatId || !firstTime(`chat:${chatId}:${id}`)) return;
-    const s = await db.collection('chats').doc(chatId).collection('messages').doc(id).get();
-    if (!s.exists) return;
-    const m = s.data();
-    if (!m.from || !m.to || m.from === m.to) return;
-    if (!isFresh(m.createdAt, 10 * 60 * 1000)) return;
-    const sender = await nameOf(m.from);
-    await sendToUser(m.to, {
-      title: sender,
-      body: previewFor(m),
-      kind: 'message',
-      data: { type: 'chat', chatId, senderId: m.from, messageId: id },
-    });
-    return;
-  }
-
-  if (type === 'group') {
-    const groupId = String(ev.groupId || '').trim();
-    if (!groupId || !firstTime(`group:${groupId}:${id}`)) return;
-    const gs = await db.collection('groups').doc(groupId).get();
-    if (!gs.exists) return;
-    const g = gs.data();
-    const members = Array.isArray(g.memberIds) ? g.memberIds : [];
-    const ms = await db.collection('groups').doc(groupId).collection('messages').doc(id).get();
-    if (!ms.exists) return;
-    const m = ms.data();
-    if (!m.from || !members.includes(m.from)) return;
-    if (!isFresh(m.createdAt, 10 * 60 * 1000)) return;
-    const sender = await nameOf(m.from);
-    const groupName = g.name || 'Group';
-    await Promise.all(
-      members
-        .filter((u) => u && u !== m.from)
-        .map((u) =>
-          sendToUser(u, {
-            title: groupName,
-            body: `${sender}: ${previewFor(m)}`,
-            kind: 'message',
-            data: { type: 'group', groupId, senderId: m.from, messageId: id },
-          })
-        )
-    );
-    return;
-  }
-
-  if (type === 'friendRequest' || type === 'friendAccepted') {
-    const s = await db.collection('friendRequests').doc(id).get();
-    if (!s.exists) return;
-    const r = s.data();
-    // The request id is the same every time the same two people re-request,
-    // so the dedupe key includes its created time.
-    const stamp = r.createdAt && typeof r.createdAt.toMillis === 'function' ? r.createdAt.toMillis() : 0;
-    if (!firstTime(`${type}:${id}:${stamp}`)) return;
-    if (type === 'friendRequest') {
-      if (r.status !== 'pending' || !r.to) return;
-      await sendToUser(r.to, {
-        title: 'New friend request',
-        body: `${r.fromName || 'Someone'} sent you a friend request`,
-        kind: 'message',
-        data: { type: 'friendRequest', requestId: id, senderId: r.from },
-      });
-    } else {
-      if (r.status !== 'accepted' || !r.from) return;
-      await sendToUser(r.from, {
-        title: 'Friend request accepted',
-        body: `${r.toName || 'Someone'} accepted your friend request`,
-        kind: 'message',
-        data: { type: 'friendAccepted', requestId: id, senderId: r.to },
-      });
-    }
+// When a call stops ringing (answered, declined, cancelled, deleted) tell the
+// called phones to stop ringing — this is what silences a closed app's alert.
+function watchCalls() {
+  if (!db) return;
+  try {
+    db.collection('calls')
+      .where('status', '==', 'ringing')
+      .onSnapshot(
+        (snap) => {
+          snap.docChanges().forEach((ch) => {
+            if (ch.type !== 'removed') return;
+            const d = ch.doc.data() || {};
+            const ids = Array.isArray(d.calleeIds) ? d.calleeIds : [];
+            ids.forEach((uid) =>
+              sendPush(uid, {
+                data: { type: 'callEnded', callId: ch.doc.id },
+                android: { priority: 'high', ttl: 30 * 1000 },
+              })
+            );
+          });
+        },
+        (err) => {
+          console.error('calls watcher error:', err.message);
+          setTimeout(watchCalls, 5000);
+        }
+      );
+  } catch (e) {
+    console.error('calls watcher failed to start:', e.message);
   }
 }
 
-app.post('/api/push/event', async (req, res) => {
-  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
-  if (!db) return res.status(503).json({ error: 'push not configured' });
-  res.json({ ok: true });
+// ── Message / friend-request pushes ─────────────────────────────────────────
+const seenEvents = new Map(); // dedupe repeated taps from the app
+function firstTime(key) {
+  const now = Date.now();
+  for (const [k, t] of seenEvents) if (now - t > 10 * 60 * 1000) seenEvents.delete(k);
+  if (seenEvents.has(key)) return false;
+  seenEvents.set(key, now);
+  return true;
+}
+
+app.post('/api/push/event', requireAuth, requireFirebase, async (req, res) => {
   try {
-    await handleEvent(req.body || {});
+    const { type, id, chatId, groupId } = req.body || {};
+    if (!type || !id) return res.status(400).json({ error: 'type and id required' });
+    if (!firstTime(`${type}:${chatId || groupId || ''}:${id}`)) return res.json({ ok: true, dup: true });
+
+    if (type === 'chat') {
+      const snap = await db.collection('chats').doc(str(chatId)).collection('messages').doc(str(id)).get();
+      if (!snap.exists) return res.status(404).json({ error: 'message not found' });
+      const m = snap.data();
+      if (!m.to || !m.from) return res.json({ ok: true });
+      if (m.visibleTo && m.visibleTo !== m.to) return res.json({ ok: true, skipped: 'private' });
+      const name = await nameOf(m.from);
+      const r = await sendPush(
+        m.to,
+        notifyMessage(name, chatPreview(m.msgType, m.text), str(chatId), { type: 'chat', chatId, from: m.from, id })
+      );
+      return res.json({ ok: true, result: r });
+    }
+
+    if (type === 'group') {
+      const gRef = db.collection('groups').doc(str(groupId));
+      const [gSnap, mSnap] = await Promise.all([gRef.get(), gRef.collection('messages').doc(str(id)).get()]);
+      if (!gSnap.exists || !mSnap.exists) return res.status(404).json({ error: 'not found' });
+      const g = gSnap.data();
+      const m = mSnap.data();
+      const name = await nameOf(m.from);
+      const members = (Array.isArray(g.memberIds) ? g.memberIds : []).filter((u) => u && u !== m.from);
+      const body = `${name}: ${chatPreview(m.msgType, m.text)}`;
+      const results = await Promise.all(
+        members.map((uid) =>
+          sendPush(uid, notifyMessage(str(g.name) || 'Group', body, str(groupId), { type: 'group', groupId, from: m.from, id }))
+        )
+      );
+      return res.json({ ok: true, sent: results.filter((r) => r === 'ok').length });
+    }
+
+    if (type === 'friendRequest' || type === 'friendAccepted') {
+      const snap = await db.collection('friendRequests').doc(str(id)).get();
+      if (!snap.exists) return res.status(404).json({ error: 'request not found' });
+      const r = snap.data();
+      if (type === 'friendRequest') {
+        const out = await sendPush(
+          r.to,
+          notifyMessage('Friend request', `${str(r.fromName) || 'Someone'} sent you a friend request`, `fr_${id}`, {
+            type: 'friendRequest',
+            id,
+          })
+        );
+        return res.json({ ok: true, result: out });
+      }
+      const out = await sendPush(
+        r.from,
+        notifyMessage('Friend request accepted', `${str(r.toName) || 'Someone'} accepted your friend request`, `fa_${id}`, {
+          type: 'friendAccepted',
+          id,
+        })
+      );
+      return res.json({ ok: true, result: out });
+    }
+
+    res.status(400).json({ error: 'unknown type' });
   } catch (e) {
     console.error('push/event:', e.message);
+    res.status(500).json({ error: 'push failed' });
   }
 });
 
-app.listen(PORT, () => console.log(`CLOVET backend listening on ${PORT}`));
+// ── AI helpers (Claude) ─────────────────────────────────────────────────────
+async function askClaude(system, user, maxTokens) {
+  if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY not set');
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: ANTHROPIC_MODEL,
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: 'user', content: user }],
+    }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(`anthropic ${r.status}: ${(j.error && j.error.message) || 'error'}`);
+  return (j.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
+}
+
+function transcript(messages, withSender) {
+  return (Array.isArray(messages) ? messages : [])
+    .slice(-60)
+    .map((m) => {
+      const who = m.fromMe ? 'Me' : withSender && m.sender ? m.sender : 'Them';
+      return `${who}: ${str(m.text).slice(0, 500)}`;
+    })
+    .join('\n');
+}
+
+app.post('/api/ai/smart-replies', requireAuth, async (req, res) => {
+  try {
+    const convo = transcript(req.body && req.body.messages, false);
+    if (!convo) return res.json({ replies: [] });
+    const out = await askClaude(
+      'You write quick-reply suggestions for a chat app. Reply ONLY with a JSON array of 3 short replies (max 6 words each) that "Me" could send next, in the same language as the conversation. No other text.',
+      convo,
+      200
+    );
+    let replies = [];
+    try {
+      const m = out.match(/\[[\s\S]*\]/);
+      replies = JSON.parse(m ? m[0] : out).map(str).filter(Boolean).slice(0, 4);
+    } catch (_) {}
+    res.json({ replies });
+  } catch (e) {
+    console.error('smart-replies:', e.message);
+    res.status(500).json({ error: 'ai failed' });
+  }
+});
+
+app.post('/api/ai/summarize', requireAuth, async (req, res) => {
+  try {
+    const convo = transcript(req.body && req.body.messages, true);
+    if (!convo) return res.json({ summary: '' });
+    const summary = await askClaude(
+      'Summarize this chat conversation in 2-4 short sentences so someone can catch up quickly. Mention who said what when it matters. Use the conversation\'s language. No preamble.',
+      convo,
+      400
+    );
+    res.json({ summary });
+  } catch (e) {
+    console.error('summarize:', e.message);
+    res.status(500).json({ error: 'ai failed' });
+  }
+});
+
+app.post('/api/ai/translate', requireAuth, async (req, res) => {
+  try {
+    const text = str(req.body && req.body.text).slice(0, 2000);
+    const lang = str(req.body && req.body.targetLanguage) || 'English';
+    if (!text) return res.json({ translated: '' });
+    const translated = await askClaude(
+      `Translate the user's message into ${lang}. Reply with ONLY the translation, nothing else.`,
+      text,
+      800
+    );
+    res.json({ translated });
+  } catch (e) {
+    console.error('translate:', e.message);
+    res.status(500).json({ error: 'ai failed' });
+  }
+});
+
+// ── Start ───────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`CLOVET backend listening on ${PORT}`);
+  watchCalls();
+});
