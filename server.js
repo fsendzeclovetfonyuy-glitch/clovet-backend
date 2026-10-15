@@ -174,6 +174,7 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 app.post('/livekit-token', requireAuth, async (req, res) => {
   try {
     if (!LIVEKIT_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
+      console.error('livekit-token: LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET missing on Render');
       return res.status(500).json({ error: 'livekit not configured' });
     }
     const { roomName, identity, participantName, displayName } = req.body || {};
@@ -187,6 +188,7 @@ app.post('/livekit-token', requireAuth, async (req, res) => {
     });
     at.addGrant({ roomJoin: true, room: str(roomName), canPublish: true, canSubscribe: true });
     const token = await at.toJwt();
+    console.log(`livekit-token issued: room ${str(roomName)} for ${id} -> ${LIVEKIT_URL}`);
     res.json({ token, url: LIVEKIT_URL });
   } catch (e) {
     console.error('livekit-token:', e.message);
