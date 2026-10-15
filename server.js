@@ -61,7 +61,14 @@ function authed(req) {
 }
 
 function requireAuth(req, res, next) {
-  if (!authed(req)) return res.status(401).json({ error: 'unauthorized' });
+  if (!authed(req)) {
+    const given = (req.body && req.body.secret) || req.get('X-App-Secret') || '';
+    console.error(
+      `401 on ${req.path}: ` +
+        (!SECRET ? 'APP_SHARED_SECRET is not set on the server' : given ? 'secret from the app does not match Render' : 'the app sent NO secret (start it with --dart-define=APP_SHARED_SECRET=...)')
+    );
+    return res.status(401).json({ error: 'unauthorized' });
+  }
   next();
 }
 
@@ -267,7 +274,7 @@ app.post('/api/push/event', requireAuth, requireFirebase, async (req, res) => {
       const name = await nameOf(m.from);
       const r = await sendPush(
         m.to,
-        notifyMessage(name, chatPreview(m.msgType, m.text), str(chatId), { type: 'chat', chatId, from: m.from, id })
+        notifyMessage(name, chatPreview(m.msgType, m.text), str(chatId), { type: 'chat', chatId, senderId: m.from, id })
       );
       return res.json({ ok: true, result: r });
     }
@@ -283,7 +290,7 @@ app.post('/api/push/event', requireAuth, requireFirebase, async (req, res) => {
       const body = `${name}: ${chatPreview(m.msgType, m.text)}`;
       const results = await Promise.all(
         members.map((uid) =>
-          sendPush(uid, notifyMessage(str(g.name) || 'Group', body, str(groupId), { type: 'group', groupId, from: m.from, id }))
+          sendPush(uid, notifyMessage(str(g.name) || 'Group', body, str(groupId), { type: 'group', groupId, senderId: m.from, id }))
         )
       );
       return res.json({ ok: true, sent: results.filter((r) => r === 'ok').length });
