@@ -8,18 +8,36 @@ const cors = require('cors');
 
 // ── Environment ─────────────────────────────────────────────────────────────
 const SECRET = process.env.APP_SHARED_SECRET || '';
-const LIVEKIT_URL = process.env.LIVEKIT_URL || '';
-const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || '';
-const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || '';
+// LiveKit settings: the exact names are preferred, but any variable starting
+// with LIVEKIT that looks like the url / api key / api secret is accepted.
+function findLivekit(exact, test) {
+  if (process.env[exact]) return { name: exact, value: process.env[exact].trim() };
+  for (const k of Object.keys(process.env)) {
+    if (/^LIVEKIT/i.test(k) && test(k.toUpperCase()) && process.env[k]) {
+      return { name: k, value: process.env[k].trim() };
+    }
+  }
+  return { name: '', value: '' };
+}
+const lkUrl = findLivekit('LIVEKIT_URL', (k) => /URL|HOST|WS|SERVER/.test(k) && !/KEY|SECRET/.test(k));
+const lkSecret = findLivekit('LIVEKIT_API_SECRET', (k) => /SECRET/.test(k));
+const lkKey = findLivekit('LIVEKIT_API_KEY', (k) => /KEY|ID/.test(k) && !/SECRET/.test(k));
+let LIVEKIT_URL = lkUrl.value;
+if (LIVEKIT_URL) {
+  LIVEKIT_URL = LIVEKIT_URL.replace(/^https:\/\//i, 'wss://').replace(/^http:\/\//i, 'ws://');
+  if (!/^wss?:\/\//i.test(LIVEKIT_URL)) LIVEKIT_URL = 'wss://' + LIVEKIT_URL;
+}
+const LIVEKIT_API_KEY = lkKey.value;
+const LIVEKIT_API_SECRET = lkSecret.value;
+console.log(
+  `LiveKit settings found -> url: ${lkUrl.name || 'MISSING'}, key: ${lkKey.name || 'MISSING'}, secret: ${lkSecret.name || 'MISSING'}`
+);
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5';
 
 for (const name of [
   'APP_SHARED_SECRET',
   'FIREBASE_SERVICE_ACCOUNT',
-  'LIVEKIT_URL',
-  'LIVEKIT_API_KEY',
-  'LIVEKIT_API_SECRET',
   'ANTHROPIC_API_KEY',
 ]) {
   if (!process.env[name]) console.error(`MISSING environment variable: ${name}`);
