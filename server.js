@@ -257,6 +257,18 @@ function watchCalls() {
                 android: { priority: 'high', ttl: 30 * 1000 },
               })
             );
+            // Nobody picked up (caller gave up / time ran out / callee was busy):
+            // leave a "Missed call" notification.
+            if (d.status === 'cancelled' || d.status === 'busy') {
+              const kind = d.isVideo === true ? 'video' : 'voice';
+              const who = str(d.callerName) || 'Someone';
+              const group = d.isGroup === true;
+              const title = group ? `Missed group ${kind} call` : `Missed ${kind} call`;
+              const body = group ? `${who} · ${str(d.title) || 'Group'}` : `From ${who}`;
+              ids.forEach((uid) =>
+                sendPush(uid, notifyMessage(title, body, `missed_${ch.doc.id}`, { type: 'missedCall', callId: ch.doc.id }))
+              );
+            }
           });
         },
         (err) => {
