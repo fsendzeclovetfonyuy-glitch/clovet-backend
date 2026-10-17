@@ -224,10 +224,20 @@ app.post('/api/push/call', requireAuth, requireFirebase, async (req, res) => {
     const d = snap.data();
     if (d.status !== 'ringing') return res.json({ ok: true, skipped: 'not ringing' });
     const ids = (Array.isArray(d.calleeIds) ? d.calleeIds : []).filter((u) => u && u !== d.callerId);
-    const message = {
-      data: callData(callId, d),
-      android: { priority: 'high', ttl: 45 * 1000 },
-    };
+    // Open-room calls (whole communities) must not ring hundreds of phones:
+    // they get a normal "tap to join" notification instead.
+    const message =
+      d.ring === false
+        ? notifyMessage(
+            str(d.title) || 'Call',
+            `${str(d.callerName) || 'Someone'} started a ${d.isVideo === true ? 'video' : 'voice'} call · tap to join`,
+            `callopen_${callId}`,
+            { type: 'callOpen', callId }
+          )
+        : {
+            data: callData(callId, d),
+            android: { priority: 'high', ttl: 45 * 1000 },
+          };
     const results = await Promise.all(ids.map((uid) => sendPush(uid, message)));
     const sent = results.filter((r) => r === 'ok').length;
     console.log(`call ${callId}: pushed ${sent}/${ids.length} (${results.join(',')})`);
@@ -250,7 +260,10 @@ function watchCalls() {
           snap.docChanges().forEach((ch) => {
             if (ch.type !== 'removed') return;
             const d = ch.doc.data() || {};
-            const ids = Array.isArray(d.calleeIds) ? d.calleeIds : [];
+            if (d.ring === false) return; // open-room call: nothing was ringing
+            const ids = (Array.isArray(d.calleeIds) ? d.calleeIds : []).filter(
+              (u) => u && u !== d.callerId
+            );
             ids.forEach((uid) =>
               sendPush(uid, {
                 data: { type: 'callEnded', callId: ch.doc.id },
