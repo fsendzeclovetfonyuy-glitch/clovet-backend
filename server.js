@@ -458,6 +458,9 @@ app.post('/api/ai/translate', requireAuth, async (req, res) => {
   }
 });
 
+// ── Delete a post and its media files (Cloudinary) ──────────────────────────
+require('./clovet-delete-post-route')(app, admin, express);
+
 // ── Start ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
