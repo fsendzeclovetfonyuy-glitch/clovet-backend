@@ -306,7 +306,7 @@ function firstTime(key) {
 
 app.post('/api/push/event', requireAuth, requireFirebase, async (req, res) => {
   try {
-    const { type, id, chatId, groupId } = req.body || {};
+    const { type, id, chatId, groupId, postId, fromId, userId } = req.body || {};
     if (!type || !id) return res.status(400).json({ error: 'type and id required' });
     if (!firstTime(`${type}:${chatId || groupId || ''}:${id}`)) return res.json({ ok: true, dup: true });
 
@@ -363,6 +363,100 @@ app.post('/api/push/event', requireAuth, requireFirebase, async (req, res) => {
         })
       );
       return res.json({ ok: true, result: out });
+    }
+
+    // ── Post / comment / follow alerts ──
+    if (type === 'postLike' || type === 'postShare' || type === 'postComment' || type === 'commentLike' || type === 'follow') {
+      const noun = (p) => (p.type === 'video' ? 'video' : p.type === 'text' ? 'post' : 'photo');
+
+      if (type === 'follow') {
+        const from = str(fromId);
+        const target = str(userId);
+        if (!from || !target || from === target) return res.json({ ok: true, skipped: 'self' });
+        const me = await db.collection('publicUsers').doc(from).get();
+        const following = me.exists && Array.isArray(me.data().following) ? me.data().following : [];
+        if (!following.includes(target)) return res.json({ ok: true, skipped: 'not following' });
+        const name = await nameOf(from);
+        const out = await sendPush(
+          target,
+          notifyMessage('New follower', `${name} started following you`, `fo_${from}`, { type: 'follow', id: from })
+        );
+        return res.json({ ok: true, result: out });
+      }
+
+      const pSnap = await db.collection('posts').doc(str(postId)).get();
+      if (!pSnap.exists) return res.status(404).json({ error: 'post not found' });
+      const post = pSnap.data();
+      const owner = str(post.authorId);
+
+      if (type === 'postLike') {
+        const from = str(fromId);
+        const likedBy = Array.isArray(post.likedBy) ? post.likedBy : [];
+        if (!owner || !from || from === owner) return res.json({ ok: true, skipped: 'self' });
+        if (!likedBy.includes(from)) return res.json({ ok: true, skipped: 'no like' });
+        const name = await nameOf(from);
+        const out = await sendPush(
+          owner,
+          notifyMessage('New like', `${name} liked your ${noun(post)}`, `lk_${postId}`, { type: 'postLike', postId })
+        );
+        return res.json({ ok: true, result: out });
+      }
+
+      if (type === 'postShare') {
+        if (!owner) return res.json({ ok: true });
+        const out = await sendPush(
+          owner,
+          notifyMessage('Your post was shared', `Someone shared your ${noun(post)}`, `sh_${postId}`, { type: 'postShare', postId })
+        );
+        return res.json({ ok: true, result: out });
+      }
+
+      const cSnap = await db.collection('posts').doc(str(postId)).collection('comments').doc(str(id)).get();
+      if (!cSnap.exists) return res.status(404).json({ error: 'comment not found' });
+      const c = cSnap.data();
+      const by = str(c.authorId);
+      if (!by) return res.json({ ok: true });
+
+      if (type === 'commentLike') {
+        const from = str(fromId);
+        const likedBy = Array.isArray(c.likedBy) ? c.likedBy : [];
+        if (!from || from === by) return res.json({ ok: true, skipped: 'self' });
+        if (!likedBy.includes(from)) return res.json({ ok: true, skipped: 'no like' });
+        const name = await nameOf(from);
+        const out = await sendPush(
+          by,
+          notifyMessage('New like', `${name} liked your comment`, `cl_${id}`, { type: 'commentLike', postId, id })
+        );
+        return res.json({ ok: true, result: out });
+      }
+
+      // postComment: tell the post's owner, and the person being replied to.
+      const name = (str(c.author) && str(c.author) !== 'You' ? str(c.author) : await nameOf(by));
+      const text = str(c.text) || (c.mediaType ? '📎 Attachment' : 'New comment');
+      const parent = str(c.parent);
+      let parentAuthor = '';
+      if (parent) {
+        const pc = await db.collection('posts').doc(str(postId)).collection('comments').doc(parent).get();
+        if (pc.exists) parentAuthor = str(pc.data().authorId);
+      }
+      const sent = [];
+      if (parentAuthor && parentAuthor !== by) {
+        sent.push(
+          await sendPush(
+            parentAuthor,
+            notifyMessage(`${name} replied to your comment`, text, `cm_${id}`, { type: 'postComment', postId, id })
+          )
+        );
+      }
+      if (owner && owner !== by && owner !== parentAuthor) {
+        sent.push(
+          await sendPush(
+            owner,
+            notifyMessage(`${name} commented on your ${noun(post)}`, text, `cm_${id}_o`, { type: 'postComment', postId, id })
+          )
+        );
+      }
+      return res.json({ ok: true, sent: sent.length });
     }
 
     res.status(400).json({ error: 'unknown type' });
