@@ -103,11 +103,28 @@ async function tokenFor(uid) {
 }
 
 // Returns 'ok' | 'no-token' | 'failed'. Never throws.
-async function sendPush(uid, message) {
+async function sendPush(uid, message, countsAsMessage = false) {
   try {
-    const token = await tokenFor(uid);
+    const ref = db.collection('fcmTokens').doc(uid);
+    const snap = await ref.get();
+    const data = snap.exists ? snap.data() : {};
+    const token = (data && data.token) || null;
     if (!token) return 'no-token';
-    await fcm.send({ token, ...message });
+    let out = message;
+    if (countsAsMessage) {
+      // The app keeps `unread` up to date with its real unread total; each new
+      // message adds one, and the phone shows that number on the app icon.
+      const unread = (Number(data.unread) > 0 ? Number(data.unread) : 0) + 1;
+      ref.set({ unread }, { merge: true }).catch(() => {});
+      out = {
+        ...message,
+        android: {
+          ...message.android,
+          notification: { ...(message.android && message.android.notification), notificationCount: unread },
+        },
+      };
+    }
+    await fcm.send({ token, ...out });
     return 'ok';
   } catch (e) {
     console.error(`fcm send to ${uid}: ${e.code || ''} ${e.message}`);
@@ -319,7 +336,8 @@ app.post('/api/push/event', requireAuth, requireFirebase, async (req, res) => {
       const name = await nameOf(m.from);
       const r = await sendPush(
         m.to,
-        notifyMessage(name, chatPreview(m.msgType, m.text), str(chatId), { type: 'chat', chatId, senderId: m.from, id })
+        notifyMessage(name, chatPreview(m.msgType, m.text), str(chatId), { type: 'chat', chatId, senderId: m.from, id }),
+        true
       );
       return res.json({ ok: true, result: r });
     }
@@ -335,7 +353,7 @@ app.post('/api/push/event', requireAuth, requireFirebase, async (req, res) => {
       const body = `${name}: ${chatPreview(m.msgType, m.text)}`;
       const results = await Promise.all(
         members.map((uid) =>
-          sendPush(uid, notifyMessage(str(g.name) || 'Group', body, str(groupId), { type: 'group', groupId, senderId: m.from, id }))
+          sendPush(uid, notifyMessage(str(g.name) || 'Group', body, str(groupId), { type: 'group', groupId, senderId: m.from, id }), true)
         )
       );
       return res.json({ ok: true, sent: results.filter((r) => r === 'ok').length });
